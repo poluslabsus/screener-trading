@@ -403,3 +403,7 @@ if show_univers:
         except Exception as e:
             st.error(f"Échec génération univers PEA : {e}")
             st.info("Si la source change de format, on adaptera le parseur (c’est normal).")
+# Force affichage de l’onglet Univers si la case est manquante
+st.sidebar.divider()
+st.sidebar.subheader("🗂 Univers")
+st.warning("➡️ Si tu ne vois pas le bouton 'Générer un CSV PEA', recharge la page (F5).")
