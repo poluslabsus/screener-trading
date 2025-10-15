@@ -289,121 +289,70 @@ st.markdown("""
 - Le **percentile BBW** compare la largeur actuelle à tout l’historique chargé (ex.: 20 = plus serrée que 80% des observations).  
 - Les **tickers** doivent être fournis via un CSV d’univers (US + Europe). Pour PEA, fournis `country_code` (ISO-2) et active le filtre **“Forcer pays UE/EEE”**.
 """)
-# --------------------
-# ONGLET : Générer un CSV d'univers PEA à jour
-# --------------------
+# =============================================================
+# SECTION FIXE : Génération du CSV d’univers PEA (Euronext)
+# =============================================================
 import io
 import requests
 
-st.sidebar.divider()
-st.sidebar.subheader("🗂 Univers")
-show_univers = st.sidebar.checkbox("Ouvrir l’onglet Univers (générer CSV PEA)")
+st.header("🗂 Générer un univers PEA à jour")
+st.write(
+    "Clique sur le bouton ci-dessous pour télécharger la liste publique des actions européennes "
+    "(Euronext, éligibles au PEA/PEA-PME)."
+)
 
-if show_univers:
-    st.header("🗂 Génération automatique de l’univers PEA")
-    st.write(
-        "Ce module télécharge une **liste publique** d’actions européennes (Euronext), "
-        "tente de récupérer **ticker / nom / pays**, puis **filtre UE/EEE** pour produire un CSV prêt pour le screener."
-    )
+url_euronext = "https://connect.euronext.com/media/169/download"
 
-    # Source publique (Euronext Connect PEA/PME – fichier Excel public).
-    # NB: selon la source du jour, la structure peut changer. On gère les cas courants.
-    url_euronext = "https://connect.euronext.com/media/169/download"
+if st.button("📥 Générer un CSV PEA depuis Euronext"):
+    try:
+        r = requests.get(url_euronext, timeout=30)
+        r.raise_for_status()
+        df_raw = pd.read_excel(io.BytesIO(r.content))
 
-    if st.button("Générer un CSV PEA (source Euronext)"):
-        try:
-            r = requests.get(url_euronext, timeout=30)
-            r.raise_for_status()
-            df_raw = pd.read_excel(io.BytesIO(r.content))
+        # Recherche des colonnes pertinentes (souvent variables)
+        cols = {c.lower(): c for c in df_raw.columns}
+        cand_name = [k for k in cols if "nom" in k or "name" in k or "issuer" in k or "company" in k]
+        cand_ticker = [k for k in cols if "ticker" in k or "mnemo" in k or "symbol" in k]
+        cand_market = [k for k in cols if "market" in k or "exchange" in k or "place" in k]
+        cand_country = [k for k in cols if "pays" in k or "country" in k]
 
-            # Tentatives de normalisation des colonnes
-            cols = {c.lower(): c for c in df_raw.columns}
-            # colonnes candidates
-            cand_name = [k for k in cols if "nom" in k or "name" in k or "issuer" in k or "company" in k]
-            cand_ticker = [k for k in cols if "ticker" in k or "mnemonic" in k or "symbol" in k or "code mnémo" in k]
-            cand_market = [k for k in cols if "market" in k or "exchange" in k or "place" in k]
-            cand_country = [k for k in cols if "pays" in k or "country" in k or "siège" in k]
+        name_col = cols.get(cand_name[0]) if cand_name else None
+        ticker_col = cols.get(cand_ticker[0]) if cand_ticker else None
+        market_col = cols.get(cand_market[0]) if cand_market else None
+        country_col = cols.get(cand_country[0]) if cand_country else None
 
-            name_col = cols[cand_name[0]] if cand_name else None
-            ticker_col = cols[cand_ticker[0]] if cand_ticker else None
-            market_col = cols[cand_market[0]] if cand_market else None
-            country_col = cols[cand_country[0]] if cand_country else None
+        work = pd.DataFrame()
+        if ticker_col: work["ticker"] = df_raw[ticker_col].astype(str).str.strip()
+        if name_col: work["name"] = df_raw[name_col].astype(str).str.strip()
+        if market_col: work["exchange"] = df_raw[market_col].astype(str).str.strip()
+        if country_col: work["country_code"] = df_raw[country_col].astype(str).str.upper()
+        else: work["country_code"] = ""
 
-            work = pd.DataFrame()
-            if ticker_col: work["ticker"] = df_raw[ticker_col].astype(str).str.strip()
-            if name_col: work["name"] = df_raw[name_col].astype(str).str.strip()
-            if market_col: work["exchange"] = df_raw[market_col].astype(str).str.strip()
-            if country_col:
-                work["country"] = df_raw[country_col].astype(str).str.strip()
-            else:
-                work["country"] = ""
-
-            # Ajout suffixes Euronext courants si manque (meilleur-effort)
-            # Si le ticker semble sans suffixe, on essaie d’inférer par 'exchange'
-            def with_suffix(row):
-                t = row.get("ticker","")
-                if "." in t:
-                    return t  # déjà suffixé (e.g., MC.PA)
-                exch = str(row.get("exchange","")).lower()
-                # mapping simple (meilleur-effort)
-                if "paris" in exch or "france" in exch:
-                    return f"{t}.PA"
-                if "amsterdam" in exch or "netherlands" in exch:
-                    return f"{t}.AS"
-                if "brussels" in exch or "belgium" in exch:
-                    return f"{t}.BR"
-                if "lisbon" in exch or "portugal" in exch:
-                    return f"{t}.LS"
-                if "dublin" in exch or "ireland" in exch:
-                    return f"{t}.IR"
+        # Ajout suffixes Euronext (.PA, .AS, .BR, .LS)
+        def add_suffix(row):
+            t = row["ticker"]
+            e = str(row.get("exchange","")).lower()
+            if "." in t:
                 return t
+            if "paris" in e: return f"{t}.PA"
+            if "amsterdam" in e: return f"{t}.AS"
+            if "brussels" in e: return f"{t}.BR"
+            if "lisbon" in e: return f"{t}.LS"
+            return t
+        work["ticker"] = work.apply(add_suffix, axis=1)
 
-            if "ticker" in work.columns:
-                work["ticker"] = work.apply(with_suffix, axis=1)
+        pea_out = work.drop_duplicates(subset=["ticker"])
+        st.success(f"✅ Univers PEA récupéré : {len(pea_out)} actions")
+        st.dataframe(pea_out.head(50), use_container_width=True)
 
-            # ISO-2 du pays (meilleur-effort par libellé)
-            map_country = {
-                "france":"FR","belgium":"BE","netherlands":"NL","portugal":"PT","ireland":"IE",
-                "germany":"DE","italy":"IT","spain":"ES","austria":"AT","finland":"FI","sweden":"SE",
-                "denmark":"DK","luxembourg":"LU","poland":"PL","romania":"RO","czech":"CZ",
-                "slovakia":"SK","slovenia":"SI","lithuania":"LT","latvia":"LV","estonia":"EE",
-                "greece":"GR","hungary":"HU","croatia":"HR","cyprus":"CY","malta":"MT",
-                "norway":"NO","iceland":"IS","liechtenstein":"LI",
-            }
+        csv_bytes = pea_out.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "💾 Télécharger pea_univers.csv",
+            data=csv_bytes,
+            file_name="pea_univers.csv",
+            mime="text/csv"
+        )
 
-            def to_iso2(x):
-                s = str(x).lower()
-                for k,v in map_country.items():
-                    if k in s:
-                        return v
-                return ""
-
-            work["country_code"] = work["country"].apply(to_iso2)
-
-            # Filtre PEA pays (UE + EEE)
-            EU_EEA = {"AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT",
-                      "LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE","NO","IS","LI"}
-            pea = work.copy()
-            pea = pea[pea["country_code"].isin(EU_EEA)]
-            pea = pea.dropna(subset=["ticker"])
-            pea = pea.drop_duplicates(subset=["ticker"])
-
-            # garde les colonnes standardisées
-            pea_out = pea[["ticker","exchange","country_code","name"]].reset_index(drop=True)
-
-            st.success(f"Univers PEA construit : {len(pea_out)} lignes.")
-            st.dataframe(pea_out.head(50), use_container_width=True)
-
-            # bouton de téléchargement
-            csv_bytes = pea_out.to_csv(index=False).encode("utf-8")
-            st.download_button("💾 Télécharger pea_univers.csv", data=csv_bytes, file_name="pea_univers.csv", mime="text/csv")
-
-            st.caption("Astuce : si certains tickers manquent de suffixes, complète-les manuellement (.PA, .AS, .BR, .LS, .IR).")
-
-        except Exception as e:
-            st.error(f"Échec génération univers PEA : {e}")
-            st.info("Si la source change de format, on adaptera le parseur (c’est normal).")
-# Force affichage de l’onglet Univers si la case est manquante
-st.sidebar.divider()
-st.sidebar.subheader("🗂 Univers")
-st.warning("➡️ Si tu ne vois pas le bouton 'Générer un CSV PEA', recharge la page (F5).")
+    except Exception as e:
+        st.error(f"Erreur : {e}")
+        st.info("Essaie de recharger la page ou d'attendre quelques minutes.")
