@@ -1,69 +1,79 @@
+# --- Screener Contraction (Bollinger Squeeze + Volatilité basse) ---
+# US + Europe (filtre PEA optionnel)
+# Collez ce fichier dans: screener_pea_streamlit.py
 
-import io
-import time
 from datetime import datetime, timedelta
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-# ---------------
-# CONFIG
-# ---------------
+# --------------------
+# CONFIG de base
+# --------------------
+st.set_page_config(page_title="Screener Contraction (Bollinger Squeeze)", layout="wide")
+
 EU_EEA_ISO2 = {
-    # EU
+    # UE
     "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT",
     "LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE",
-    # EEA (non-EU)
+    # EEE (hors UE)
     "NO","IS","LI",
 }
-# Not eligible (examples): "GB","CH","US","CA"
-EXCLUDE_ISO2 = {"GB","CH","US","CA"}
+EXCLUDE_ISO2 = {"GB","CH","US","CA"}  # utile si on veut forcer EU/EEE seulement
 
-DEFAULT_LOOKBACK_DAYS = 260  # ~1y trading days
-PRICE_INTERVAL = "1d"
+# --------------------
+# UI
+# --------------------
+st.title("🔎 Screener de Contraction — Bollinger Squeeze + Volatilité basse")
+st.caption("Analyse multi-marchés (US + Europe). Charge un univers de tickers, calcule le resserrement des Bandes de Bollinger + volatilité, et filtre les titres en contraction.")
 
-st.set_page_config(page_title="PEA Screener (EU/EEA)", layout="wide")
+with st.sidebar:
+    st.header("⚙️ Paramètres")
+    uploaded_csv = st.file_uploader("Univers de titres (CSV)", type=["csv"])
+    st.markdown(
+        "Le CSV doit contenir au moins **ticker** et idéalement **country_code** (ISO-2), **name**, **exchange**, **sector**.\n\n"
+        "Exemples: `AAPL` (US), `MC.PA` (FR/Euronext), `ASML.AS` (NL), `SAP.DE` (DE), `ENEL.MI` (IT)"
+    )
 
-st.title("🔎 PEA Screener — Actions éligibles (EU/EEE)")
-st.caption("Charge un univers de tickers européens, filtre l’éligibilité PEA par pays (siège social EU/EEE), puis applique des filtres techniques/volume.")
+    # Fenêtres et seuils techniques
+    lookback_days = st.number_input("Période d'historique (jours calendaires)", 120, 800, 260, step=10)
+    bb_window = st.number_input("Période Bollinger (jours)", 10, 100, 20, step=1)
+    bb_std = st.number_input("Écart-type Bollinger", 1.0, 3.5, 2.0, step=0.1)
+    atr_window = st.number_input("Période ATR (jours)", 5, 50, 14, step=1)
+    vol_window = st.number_input("Période volatilité (écart-type des retours, jours)", 5, 60, 20, step=1)
 
-# ---------------
-# SIDEBAR
-# ---------------
-st.sidebar.header("⚙️ Paramètres")
-uploaded_csv = st.sidebar.file_uploader("Univers de titres (CSV)", type=["csv"])
+    st.divider()
+    st.subheader("🎯 Critères de contraction")
+    bbw_pct_threshold = st.slider(
+        "Seuil de percentile du **Bollinger Band Width** (BBW) vs son historique (plus petit = plus serré)",
+        1, 50, 20, help="Ex: 20 = BBW actuel est dans les 20% les plus bas de la période"
+    )
+    max_atr_pct = st.slider("ATR% max (ATR / Close, en %)", 0.1, 10.0, 2.0, step=0.1)
+    max_sigma_pct = st.slider("Volatilité 20j max (σ retours * 100, en %)", 0.1, 10.0, 2.5, step=0.1)
 
-min_price = st.sidebar.number_input("Prix min (€)", value=1.0, step=0.5)
-min_avg_vol = st.sidebar.number_input("Volume moyen min (sur 20j)", value=20000.0, step=1000.0)
-min_mcap = st.sidebar.number_input("Capitalisation boursière min (€)", value=0.0, step=1_000_000.0, help="Laisse 0 si non disponible via Yahoo pour certains marchés.")
-rsi_bounds = st.sidebar.slider("RSI(14) entre", 10, 90, (30, 70))
-mom_window = st.sidebar.selectbox("Fenêtre Momentum (jours)", [20, 60, 125, 200], index=2)
-sma_short = st.sidebar.number_input("SMA courte (jours)", value=20, step=1)
-sma_long  = st.sidebar.number_input("SMA longue (jours)", value=50, step=1)
+    st.divider()
+    st.subheader("🧹 Filtres pratiques")
+    min_price = st.number_input("Prix minimum", 0.0, 10000.0, 1.0, step=0.5)
+    min_avg_vol = st.number_input("Volume moyen 20j minimum", 0.0, 5_000_000.0, 50_000.0, step=5_000.0)
+    force_pea = st.checkbox("Forcer pays UE/EEE (filtre PEA pays)", value=False)
+    exclude_non_eee = st.checkbox("Exclure GB/CH/US/CA si pas de PEA forcé", value=False)
 
-enable_pea_filter = st.sidebar.checkbox("Forcer filtre PEA (pays EU/EEE)", value=True)
-exclude_st = st.sidebar.checkbox("Exclure tickers hors EU/EEE connus", value=True)
+    st.divider()
+    dl_cols = st.text_input(
+        "Colonnes à exporter (séparées par des virgules)",
+        value="ticker,name,exchange,country_code,close,avg_vol_20,bbw,bbw_percentile,atr_pct,sigma20_pct,contraction_score"
+    )
 
-st.sidebar.divider()
-download_cols = st.sidebar.text_input("Colonnes à exporter (séparées par des virgules)", value="ticker,name,exchange,country_code,close,avg_vol_20,rsi_14,mom,sma_short,sma_long,above_sma_long,mkt_cap,pe_ratio,sector")
-
-# ---------------
+# --------------------
 # Helpers
-# ---------------
+# --------------------
 def parse_universe(df: pd.DataFrame) -> pd.DataFrame:
     cols_map = {
-        "ticker": "ticker",
-        "symbol": "ticker",
-        "isin": "isin",
-        "exchange": "exchange",
-        "mic": "mic",
-        "name": "name",
-        "company": "name",
-        "country": "country_code",
-        "country_code": "country_code",
-        "country_iso2": "country_code",
+        "ticker": "ticker", "symbol": "ticker",
+        "exchange": "exchange", "mic": "mic",
+        "name": "name", "company": "name",
+        "country": "country_code", "country_code": "country_code", "country_iso2": "country_code",
         "sector": "sector",
     }
     out = {}
@@ -83,68 +93,87 @@ def parse_universe(df: pd.DataFrame) -> pd.DataFrame:
 def is_pea_country(iso2: str) -> bool:
     return iso2 in EU_EEA_ISO2
 
-def technicals_from_prices(prices: pd.DataFrame) -> pd.DataFrame:
-    # Expect 'Close' and 'Volume'
-    df = prices.copy()
-    df["rsi_14"] = rsi(df["Close"], 14)
-    df["sma_short"] = df["Close"].rolling(sma_short).mean()
-    df["sma_long"]  = df["Close"].rolling(sma_long).mean()
-    df["avg_vol_20"] = df["Volume"].rolling(20).mean()
-    df[f"mom"] = df["Close"].pct_change(mom_window)
-    return df
+def compute_indicators(px: pd.DataFrame, bb_win: int, bb_std: float, atr_win: int, vol_win: int):
+    """px: DataFrame avec colonnes ['Open','High','Low','Close','Volume'] indexées en date"""
+    df = px.copy()
 
-def rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=close.index).ewm(alpha=1/period, adjust=False).mean()
-    roll_down = pd.Series(down, index=close.index).ewm(alpha=1/period, adjust=False).mean()
-    rs = roll_up / (roll_down + 1e-9)
-    return 100 - (100 / (1 + rs))
+    # Bollinger Bands
+    sma = df["Close"].rolling(bb_win).mean()
+    stdev = df["Close"].rolling(bb_win).std(ddof=0)
+    upper = sma + bb_std * stdev
+    lower = sma - bb_std * stdev
+    bbw = (upper - lower) / sma  # largeur normalisée
+    df["bbw"] = bbw
 
-def fetch_yf_bulk(tickers: list, start: datetime, end: datetime, interval="1d"):
-    # yfinance multi-download for speed; returns dict of DataFrames per ticker
+    # Percentile du BBW actuel vs historique (sur tout le lookback)
+    # On calcule le rang percentile du dernier point par rapport à l'historique récent
+    def last_percentile(series: pd.Series):
+        s = series.dropna()
+        if s.empty:
+            return np.nan
+        last = s.iloc[-1]
+        rank = (s <= last).mean() * 100.0
+        return rank
+
+    # ATR (True Range)
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(atr_win).mean()
+    atr_pct = (atr / close) * 100.0
+    df["atr_pct"] = atr_pct
+
+    # Volatilité (écart-type des rendements 1j)
+    ret = close.pct_change()
+    sigma20 = ret.rolling(vol_win).std(ddof=0) * 100.0
+    df["sigma20_pct"] = sigma20
+
+    # Valeurs du jour (dernière ligne)
+    last = df.iloc[-1]
+    out = {
+        "close": float(last["Close"]),
+        "avg_vol_20": float(df["Volume"].rolling(20).mean().iloc[-1]) if "Volume" in df else np.nan,
+        "bbw": float(last["bbw"]) if not np.isnan(last["bbw"]) else np.nan,
+        "bbw_percentile": float(last_percentile(df["bbw"])),
+        "atr_pct": float(last["atr_pct"]) if not np.isnan(last["atr_pct"]) else np.nan,
+        "sigma20_pct": float(last["sigma20_pct"]) if not np.isnan(last["sigma20_pct"]) else np.nan,
+    }
+    return out
+
+def yf_bulk(tickers: list, start, end):
     data = yf.download(
         tickers=tickers,
         start=start.strftime("%Y-%m-%d"),
         end=end.strftime("%Y-%m-%d"),
-        interval=interval,
+        interval="1d",
         group_by="ticker",
         auto_adjust=False,
         threads=True,
         progress=False,
     )
     out = {}
-    # yfinance returns multi-index columns when multiple tickers
     if isinstance(data.columns, pd.MultiIndex):
         for t in tickers:
             try:
                 df = data[t].dropna()
-                if not df.empty:
-                    out[t] = df
+                if not df.empty: out[t] = df
             except Exception:
                 pass
     else:
-        # Single ticker case
         out[tickers[0]] = data.dropna()
     return out
 
-def fetch_static_fundamentals(ticker: str):
-    # Use yfinance info (best-effort; can be slow/incomplete by market)
-    try:
-        info = yf.Ticker(ticker).fast_info
-        mkt_cap = info.get("market_cap", np.nan)
-        pe = np.nan  # fast_info has no PE; fallback to .info (slow) only when needed
-    except Exception:
-        mkt_cap = np.nan
-        pe = np.nan
-    return mkt_cap, pe
-
-# ---------------
+# --------------------
 # MAIN
-# ---------------
+# --------------------
 if uploaded_csv is None:
-    st.info("Charge un CSV d’univers pour commencer. Colonnes acceptées: ticker, exchange, country_code, name, sector.")
+    st.info("➡️ Charge un CSV d’univers (tickers). Tu peux commencer petit (quelques dizaines) puis élargir.")
     st.stop()
 
 try:
@@ -154,27 +183,31 @@ except Exception as e:
     st.error(f"Erreur lecture CSV: {e}")
     st.stop()
 
-# PEA filter by country
-if enable_pea_filter:
+# Filtres pays (PEA)
+if force_pea:
     before = len(universe)
     universe = universe[universe["country_code"].apply(is_pea_country)]
-    st.success(f"Filtre PEA (pays EU/EEE) appliqué: {before} → {len(universe)} titres.")
-elif exclude_st:
+    st.success(f"Filtre PEA (pays UE/EEE) appliqué : {before} → {len(universe)} titres.")
+elif exclude_non_eee:
     before = len(universe)
     universe = universe[~universe["country_code"].isin(EXCLUDE_ISO2)]
-    st.success(f"Exclusion pays non-UE/EEE courants (GB/CH/US/CA): {before} → {len(universe)} titres.")
+    st.info(f"Exclusion GB/CH/US/CA : {before} → {len(universe)} titres.")
 
 if universe.empty:
-    st.warning("Univers vide après filtres pays. Vérifie les codes pays ou désactive le filtre PEA.")
+    st.warning("Univers vide après filtres pays. Vérifie les codes pays (ISO-2) ou désactive le filtre.")
     st.stop()
 
-# Fetch prices
+# Téléchargement des prix
 end = datetime.utcnow()
-start = end - timedelta(days=DEFAULT_LOOKBACK_DAYS)
+start = end - timedelta(days=int(lookback_days))
+tickers = universe["ticker"].tolist()
 
-tickers = universe["ticker"].tolist()[:400]  # safety cap for demo; increase as needed
-with st.spinner(f"Téléchargement des prix pour {len(tickers)} tickers…"):
-    prices_map = fetch_yf_bulk(tickers, start, end, interval=PRICE_INTERVAL)
+# Cap raisonnable pour la démo gratuite (évite timeouts)
+CAP = st.number_input("Cap téléchargements (sécurité)", 10, 2000, min(500, len(tickers)), step=10)
+tickers = tickers[:int(CAP)]
+
+with st.spinner(f"Téléchargement des données pour {len(tickers)} tickers…"):
+    prices_map = yf_bulk(tickers, start, end)
 
 rows = []
 for _, row in universe.iterrows():
@@ -182,18 +215,34 @@ for _, row in universe.iterrows():
     px = prices_map.get(t)
     if px is None or px.empty or "Close" not in px.columns:
         continue
-    tech = technicals_from_prices(px)
-    last = tech.iloc[-1]
-    close = float(last["Close"])
-    avg_vol_20 = float(last.get("avg_vol_20", np.nan))
-    rsi_14 = float(last.get("rsi_14", np.nan))
-    sma_s = float(last.get("sma_short", np.nan))
-    sma_l = float(last.get("sma_long", np.nan))
-    above_sma_long = bool(close > sma_l) if not np.isnan(sma_l) else False
-    mom = float(last.get("mom", np.nan))
 
-    # fundamentals (best-effort)
-    mkt_cap, pe_ratio = fetch_static_fundamentals(t)
+    try:
+        metrics = compute_indicators(px, bb_window, bb_std, atr_window, vol_window)
+    except Exception:
+        continue
+
+    # Filtres pratiques
+    if not np.isnan(metrics["close"]) and metrics["close"] < min_price:
+        continue
+    if not np.isnan(metrics["avg_vol_20"]) and metrics["avg_vol_20"] < min_avg_vol:
+        continue
+
+    # Critères de contraction
+    cond_bbw = (not np.isnan(metrics["bbw_percentile"])) and (metrics["bbw_percentile"] <= bbw_pct_threshold)
+    cond_atr = (not np.isnan(metrics["atr_pct"])) and (metrics["atr_pct"] <= max_atr_pct)
+    cond_sig = (not np.isnan(metrics["sigma20_pct"])) and (metrics["sigma20_pct"] <= max_sigma_pct)
+
+    passes = cond_bbw and cond_atr and cond_sig
+
+    # Score (plus bas = plus “serré” ; on l’inverse pour trier décroissant)
+    # On fabrique un score où plus c’est serré, plus il est élevé (1.0 max ~ squeeze fort)
+    score = 0.0
+    if not np.isnan(metrics["bbw_percentile"]):
+        score += (100 - metrics["bbw_percentile"]) / 100.0  # bas percentile -> haut score
+    if not np.isnan(metrics["atr_pct"]):
+        score += max(0.0, (max_atr_pct - metrics["atr_pct"]) / max_atr_pct) * 0.5
+    if not np.isnan(metrics["sigma20_pct"]):
+        score += max(0.0, (max_sigma_pct - metrics["sigma20_pct"]) / max_sigma_pct) * 0.5
 
     rows.append({
         "ticker": t,
@@ -201,51 +250,42 @@ for _, row in universe.iterrows():
         "exchange": row.get("exchange", ""),
         "country_code": row.get("country_code", ""),
         "sector": row.get("sector", ""),
-        "close": close,
-        "avg_vol_20": avg_vol_20,
-        "rsi_14": rsi_14,
-        "mom": mom,
-        "sma_short": sma_s,
-        "sma_long": sma_l,
-        "above_sma_long": above_sma_long,
-        "mkt_cap": mkt_cap,
-        "pe_ratio": pe_ratio,
+
+        "close": metrics["close"],
+        "avg_vol_20": metrics["avg_vol_20"],
+        "bbw": metrics["bbw"],
+        "bbw_percentile": metrics["bbw_percentile"],
+        "atr_pct": metrics["atr_pct"],
+        "sigma20_pct": metrics["sigma20_pct"],
+
+        "contraction_match": passes,
+        "contraction_score": round(score, 4),
     })
 
 results = pd.DataFrame(rows)
+if results.empty:
+    st.warning("Aucun résultat (avec les seuils actuels). Essaie d’assouplir les sliders (BBW percentile plus haut, ATR% plus haut, etc.).")
+    st.stop()
 
-# Filters
-mask = (
-    (results["close"] >= min_price) &
-    (results["avg_vol_20"] >= min_avg_vol) &
-    (results["rsi_14"].between(rsi_bounds[0], rsi_bounds[1], inclusive="both")) &
-    (results["mkt_cap"] >= min_mcap)
-)
-filtered = results[mask].copy()
+# Conserver uniquement les matchs
+filtered = results[results["contraction_match"] == True].copy()
+filtered = filtered.sort_values("contraction_score", ascending=False).reset_index(drop=True)
 
-# Ranking example: combine momentum + trend
-filtered["score"] = (
-    filtered["mom"].fillna(0)*2 +
-    filtered["above_sma_long"].astype(int)*0.5 +
-    (filtered["rsi_14"].sub(50).abs().rsub(50)/50).fillna(0)*0.5
-)
+st.subheader("📈 Résultats — Contraction détectée")
+st.caption("Triés par score de contraction (combinaison: BBW percentile bas + ATR% bas + σ20% basse).")
+st.dataframe(filtered, use_container_width=True)
 
-filtered = filtered.sort_values("score", ascending=False)
-
-st.subheader("📈 Résultats filtrés")
-st.dataframe(filtered.reset_index(drop=True), use_container_width=True)
-
-# Download
-cols = [c.strip() for c in download_cols.split(",") if c.strip() in filtered.columns]
+# Download CSV
+cols = [c.strip() for c in dl_cols.split(",") if c.strip() in filtered.columns]
 if not cols:
     cols = list(filtered.columns)
-csv = filtered[cols].to_csv(index=False).encode("utf-8")
-st.download_button("💾 Télécharger CSV filtré", data=csv, file_name="pea_screener_results.csv", mime="text/csv")
+csv_bytes = filtered[cols].to_csv(index=False).encode("utf-8")
+st.download_button("💾 Télécharger CSV", data=csv_bytes, file_name="screener_contraction_results.csv", mime="text/csv")
 
 st.divider()
-st.caption("""
-ℹ️ **Notes importantes**  
-- L’éligibilité PEA réelle dépend du **siège social dans l’UE/EEE** et de l’assujettissement à l’IS local. Ici, on filtre par **code pays** fourni dans le CSV.  
-- Les actions US **ne sont pas éligibles au PEA**. Pour exposer le marché US via PEA, utilise des **ETF éligibles PEA** (avec quota UE ≥ 75%) — à gérer dans un univers séparé.  
-- Yahoo Finance peut manquer de données (volumes, capi) pour certains marchés; pour un usage pro, préfère une API marchande (EODHD, Polygon, Finnhub, Quandl/Nasdaq, etc.).
+st.markdown("""
+**Notes**
+- *Contraction* ≈ **Bandes de Bollinger serrées** (BBW faible vs son propre historique) **ET** **volatilité basse** (ATR% et σ20% faibles).  
+- Le **percentile BBW** compare la largeur actuelle à tout l’historique chargé (ex.: 20 = plus serrée que 80% des observations).  
+- Les **tickers** doivent être fournis via un CSV d’univers (US + Europe). Pour PEA, fournis `country_code` (ISO-2) et active le filtre **“Forcer pays UE/EEE”**.
 """)
